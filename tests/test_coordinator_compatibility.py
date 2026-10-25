@@ -137,8 +137,9 @@ def test_arc_response_formats(coordinator, response, expected):
     assert coordinator.ds["system_info"]["cache_size-arc_value"] == expected
 
 
-def test_graph_failure_isolation_is_bounded_and_keeps_valid_results(coordinator):
-    coordinator.api.error = 500
+@pytest.mark.parametrize("error", ["malformed_result", "request failed"])
+def test_graph_failure_isolation_is_bounded_and_keeps_valid_results(coordinator, error):
+    coordinator.api.error = error
 
     def query(method, params):
         graphs, options = params
@@ -209,3 +210,97 @@ def test_disk_temperatures_need_no_version_specific_argument_names(coordinator):
     assert coordinator.ds["disk"]["disk-1"]["temperature"] == 36
     assert coordinator.api.query.call_args.args == ("disk.temperatures",)
     assert coordinator.api.query.call_args.kwargs == {"params": {}}
+
+
+def test_transport_failure_does_not_disable_supported_graphs(coordinator):
+    coordinator.api.query.return_value = None
+    coordinator.api.error = "connection reset"
+    coordinator.api.connected.return_value = False
+    coordinator.get_systemstats()
+    assert coordinator.api.query.call_count == 2
+    assert coordinator._systemstats_errored == []
+
+
+@pytest.mark.parametrize("total", [32, 0, None])
+def test_total_cpu_clears_old_component_attributes(coordinator, total):
+    coordinator.api.query.return_value = [
+        graph("cpu", softirq=1, system=7, user=12, nice=2, iowait=3, idle=75)
+    ]
+    coordinator.get_systemstats()
+    info = coordinator.ds["system_info"]
+    assert info["cpu_system"] == 7
+    coordinator.api.query.return_value = [graph("cpu", cpu=total)]
+    coordinator.get_systemstats()
+    assert info["cpu_usage"] == total
+    for component in ("softirq", "system", "user", "nice", "iowait", "idle"):
+        assert info[f"cpu_{component}"] is None
+
+
+def test_legacy_cpu_components_can_return_after_a_total_response(coordinator):
+    coordinator.api.query.return_value = [graph("cpu", cpu=32)]
+    coordinator.get_systemstats()
+    coordinator.api.query.return_value = [
+        graph("cpu", softirq=1, system=7, user=12, nice=2, iowait=3, idle=75)
+    ]
+    coordinator.get_systemstats()
+    info = coordinator.ds["system_info"]
+    assert info["cpu_usage"] == 19
+    assert info["cpu_system"] == 7
+    assert info["cpu_idle"] == 75
+
+
+def test_available_memory_clears_old_cached_and_buffered_attributes(coordinator):
+    coordinator.api.query.return_value = [
+        graph("memory", free=2048, used=4096, cached=1024, buffers=1024)
+    ]
+    coordinator.get_systemstats()
+    coordinator.api.query.return_value = [graph("memory", available=2048 * MIB)]
+    coordinator.get_systemstats()
+    info = coordinator.ds["system_info"]
+    assert info["memory-used_value"] == 6144 * MIB
+    assert info["memory-cached_value"] is None
+    assert info["memory-buffered_value"] is None
+
+
+def test_legacy_memory_details_can_return_after_available_memory(coordinator):
+    coordinator.api.query.return_value = [graph("memory", available=2048 * MIB)]
+    coordinator.get_systemstats()
+    coordinator.api.query.return_value = [
+        graph("memory", free=2048, used=4096, cached=1024, buffers=1024)
+    ]
+    coordinator.get_systemstats()
+    info = coordinator.ds["system_info"]
+    assert info["memory-cached_value"] == 1024 * MIB
+    assert info["memory-buffered_value"] == 1024 * MIB
+
+
+def test_reporting_retries_use_real_websocket_error_handling(coordinator):
+    from json import dumps, loads
+
+    from custom_components.truenas.api import TrueNASAPI
+
+    api = TrueNASAPI("nas.example", "test-key")
+    api._connected = True
+    api._ws = Mock()
+    error = {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "error": {"code": -32000, "message": "Graph unavailable"},
+    }
+    api._ws.recv.side_effect = [
+        dumps(error),
+        dumps({"result": []}),
+        dumps(error),
+        dumps({"result": [graph("cpu", cpu=25)]}),
+        dumps({"result": []}),
+        dumps({"result": []}),
+    ]
+    coordinator.api = api
+    coordinator.get_systemstats()
+    assert api._ws.send.call_count == 6
+    assert coordinator._systemstats_errored == ["cputemp"]
+    assert coordinator.ds["system_info"]["cpu_usage"] == 25
+    requests = [loads(call.args[0]) for call in api._ws.send.call_args_list]
+    assert all(r["method"] == "reporting.get_data" for r in requests)
+    assert len(requests[0]["params"][0]) == 5
+    assert all(len(r["params"][0]) == 1 for r in requests[1:])

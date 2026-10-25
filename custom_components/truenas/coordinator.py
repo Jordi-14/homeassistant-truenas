@@ -366,15 +366,16 @@ class TrueNASCoordinator(DataUpdateCoordinator[None]):
         )
 
         if not isinstance(tmp_graph, list):
-            if self.api.error != 500:
-                return
             tmp_graph = []
             for graph in tmp_graphs:
                 result = self.api.query(reporting_path, params=[[graph], tmp_params[1]])
                 if isinstance(result, list):
                     tmp_graph.extend(result)
-                elif self.api.error == 500:
+                elif self.api.connected():
                     self._systemstats_errored.append(graph["name"])
+                else:
+                    # A transport failure does not make the graph unsupported.
+                    break
             _LOGGER.warning(
                 "TrueNAS %s fetching following graphs failed, check your NAS: %s",
                 self.host,
@@ -403,6 +404,16 @@ class TrueNASCoordinator(DataUpdateCoordinator[None]):
             if tmp_graph[i]["name"] == "cpu":
                 means = tmp_graph[i].get("aggregations", {}).get("mean", {})
                 if "cpu" in means:
+                    for component in (
+                        "interrupt",
+                        "softirq",
+                        "system",
+                        "user",
+                        "nice",
+                        "iowait",
+                        "idle",
+                    ):
+                        self.ds["system_info"][f"cpu_{component}"] = None
                     value = means["cpu"]
                     self.ds["system_info"]["cpu_usage"] = (
                         round(value, 2) if value is not None else None
@@ -492,6 +503,8 @@ class TrueNASCoordinator(DataUpdateCoordinator[None]):
                     tmp_val = graph["aggregations"]["mean"][e] or 0.0
                     if t == "memory":
                         if tmp_var == "available":
+                            self.ds["system_info"]["memory-cached_value"] = None
+                            self.ds["system_info"]["memory-buffered_value"] = None
                             self.ds["system_info"]["memory-free_value"] = round(tmp_val)
                             self.ds["system_info"]["memory-used_value"] = round(
                                 self.ds["system_info"]["physmem"] - tmp_val
