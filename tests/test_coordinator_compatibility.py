@@ -33,7 +33,6 @@ def coordinator():
     obj._version_major = 0
     obj._version_minor = 0
     obj._is_virtual = False
-    obj._systemstats_errored = []
     obj.get_systeminfo()
     obj.api.query.reset_mock(side_effect=True)
     return obj
@@ -138,7 +137,9 @@ def test_arc_response_formats(coordinator, response, expected):
 
 
 @pytest.mark.parametrize("error", ["malformed_result", "request failed"])
-def test_graph_failure_isolation_is_bounded_and_keeps_valid_results(coordinator, error):
+def test_graph_failure_isolation_is_bounded_and_keeps_valid_results(
+    coordinator, error, caplog
+):
     coordinator.api.error = error
 
     def query(method, params):
@@ -152,16 +153,8 @@ def test_graph_failure_isolation_is_bounded_and_keeps_valid_results(coordinator,
     coordinator.api.query.side_effect = query
     coordinator.get_systemstats()
     assert coordinator.api.query.call_count == 6
-    assert coordinator._systemstats_errored == ["cputemp"]
+    assert "cputemp" in caplog.text
     assert coordinator.ds["system_info"]["cpu_usage"] == 25
-
-
-def test_excluded_adjacent_graphs_are_both_removed(coordinator):
-    coordinator._systemstats_errored = ["load", "cputemp"]
-    coordinator.api.query.return_value = []
-    coordinator.get_systemstats()
-    graphs = coordinator.api.query.call_args.kwargs["params"][0]
-    assert [g["name"] for g in graphs] == ["cpu", "arcsize", "memory"]
 
 
 @pytest.mark.parametrize("version", [(24, 10), (25, 4)])
@@ -212,13 +205,13 @@ def test_disk_temperatures_need_no_version_specific_argument_names(coordinator):
     assert coordinator.api.query.call_args.kwargs == {"params": {}}
 
 
-def test_transport_failure_does_not_disable_supported_graphs(coordinator):
+def test_transport_failure_does_not_disable_supported_graphs(coordinator, caplog):
     coordinator.api.query.return_value = None
     coordinator.api.error = "connection reset"
     coordinator.api.connected.return_value = False
     coordinator.get_systemstats()
     assert coordinator.api.query.call_count == 2
-    assert coordinator._systemstats_errored == []
+    assert "failed this poll" in caplog.text
 
 
 @pytest.mark.parametrize("total", [32, 0, None])
@@ -274,7 +267,7 @@ def test_legacy_memory_details_can_return_after_available_memory(coordinator):
     assert info["memory-buffered_value"] == 1024 * MIB
 
 
-def test_reporting_retries_use_real_websocket_error_handling(coordinator):
+def test_reporting_retries_use_real_websocket_error_handling(coordinator, caplog):
     from json import dumps, loads
 
     from custom_components.truenas.api import TrueNASAPI
@@ -298,9 +291,98 @@ def test_reporting_retries_use_real_websocket_error_handling(coordinator):
     coordinator.api = api
     coordinator.get_systemstats()
     assert api._ws.send.call_count == 6
-    assert coordinator._systemstats_errored == ["cputemp"]
+    assert "cputemp" in caplog.text
     assert coordinator.ds["system_info"]["cpu_usage"] == 25
     requests = [loads(call.args[0]) for call in api._ws.send.call_args_list]
     assert all(r["method"] == "reporting.get_data" for r in requests)
     assert len(requests[0]["params"][0]) == 5
     assert all(len(r["params"][0]) == 1 for r in requests[1:])
+
+
+def test_temporary_graph_failure_recovers_on_the_next_poll(coordinator):
+    requests = []
+    failed = graph("cputemp", core0=55)
+
+    def first_poll(method, params):
+        graphs, options = params
+        requests.append(graphs)
+        if len(graphs) > 1 or graphs[0]["name"] == "cputemp":
+            return {"error": {"message": "temporarily unavailable"}}
+        return []
+
+    coordinator.api.query.side_effect = first_poll
+    coordinator.get_systemstats()
+    assert len(requests) == 6
+    coordinator.api.query.reset_mock(side_effect=True)
+    coordinator.api.query.return_value = [failed]
+    coordinator.get_systemstats()
+    graphs = coordinator.api.query.call_args.kwargs["params"][0]
+    assert {"name": "cputemp"} in graphs
+    assert coordinator.ds["system_info"]["cpu_temperature"] == 55
+
+
+def test_interface_failure_does_not_hide_other_interfaces(coordinator, caplog):
+    coordinator.ds["interface"] = {"eth0": {}, "eth1": {}}
+
+    def first_poll(method, params):
+        graphs, options = params
+        if len(graphs) > 1 or graphs[0] == {"name": "interface", "identifier": "eth0"}:
+            return {"error": {"message": "temporarily unavailable"}}
+        if graphs[0].get("identifier") == "eth1":
+            result = graph("interface", received=100, sent=50)
+            result["identifier"] = "eth1"
+            return [result]
+        return []
+
+    coordinator.api.query.side_effect = first_poll
+    coordinator.get_systemstats()
+    assert coordinator.ds["interface"]["eth1"]["rx"] == 12.21
+    assert "eth0" in caplog.text
+    assert "eth1" not in caplog.text
+    coordinator.api.query.reset_mock(side_effect=True)
+    coordinator.api.query.return_value = []
+    coordinator.get_systemstats()
+    graphs = coordinator.api.query.call_args.kwargs["params"][0]
+    assert {"name": "interface", "identifier": "eth0"} in graphs
+    assert {"name": "interface", "identifier": "eth1"} in graphs
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        graph("memory", available=None),
+        graph("memory", free=None, used=4096, cached=None, buffers=None),
+        {"name": "memory", "legend": ["time", "available"]},
+        graph("memory"),
+    ],
+)
+def test_missing_memory_does_not_report_full_usage(coordinator, response):
+    coordinator.api.query.return_value = [graph("memory", available=2048 * MIB)]
+    coordinator.get_systemstats()
+    assert coordinator.ds["system_info"]["memory-usage_percent"] == 75
+    coordinator.api.query.return_value = [response]
+    coordinator.get_systemstats()
+    info = coordinator.ds["system_info"]
+    assert info["memory-free_value"] is None
+    assert info["memory-usage_percent"] is None
+    assert info["memory-cached_value"] is None
+    assert info["memory-buffered_value"] is None
+    if "available" in response.get("legend", []):
+        assert info["memory-used_value"] is None
+
+
+def test_zero_available_memory_is_a_valid_measurement(coordinator):
+    coordinator.api.query.return_value = [graph("memory", available=0)]
+    coordinator.get_systemstats()
+    info = coordinator.ds["system_info"]
+    assert info["memory-free_value"] == 0
+    assert info["memory-used_value"] == 8192 * MIB
+    assert info["memory-usage_percent"] == 100
+
+
+def test_available_memory_recovers_after_missing_reading(coordinator):
+    coordinator.api.query.return_value = [graph("memory", available=None)]
+    coordinator.get_systemstats()
+    coordinator.api.query.return_value = [graph("memory", available=2048 * MIB)]
+    coordinator.get_systemstats()
+    assert coordinator.ds["system_info"]["memory-usage_percent"] == 75
