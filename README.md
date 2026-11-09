@@ -1,6 +1,6 @@
 # TrueNAS Integration
 ![GitHub release (latest by date)](https://img.shields.io/github/v/release/tomaae/homeassistant-truenas?style=plastic)
-[![hacs_badge](https://img.shields.io/badge/HACS-Default-41BDF5.svg?style=plastic)](https://github.com/hacs/integration)
+[![Marketplace](https://img.shields.io/badge/Marketplace-Integration-41BDF5.svg?style=plastic)](https://www.home-assistant.io/integrations/marketplace/)
 ![Project Stage](https://img.shields.io/badge/project%20stage-development-yellow.svg?style=plastic)
 ![GitHub all releases](https://img.shields.io/github/downloads/tomaae/homeassistant-truenas/total?style=plastic)
 
@@ -99,9 +99,14 @@ Target system uptime sensor.
 ![image](https://user-images.githubusercontent.com/36953052/221521930-f8f789e6-deec-4cc2-b11e-740caa056e44.png)
 
 # Install integration
-This integration is distributed using [HACS](https://hacs.xyz/).
+Home Assistant 2026.11 and later include the **Marketplace** under **Settings > Marketplace**. It replaces HACS and carries over existing installations automatically. On older supported Home Assistant versions, continue using HACS. See the [Marketplace documentation](https://www.home-assistant.io/integrations/marketplace/).
 
-You can find it under "Integrations", named "TrueNAS"
+The upstream TrueNAS integration is listed in the shared catalog as **TrueNAS**.
+Check the repository URL before installing: this `Jordi-14` fork is a different
+repository. To install this fork on HA 2026.11+, use **Settings > Marketplace >
+Add from link** with `https://github.com/Jordi-14/homeassistant-truenas`, connect
+GitHub if requested, then install the repository. On older HA versions, add that
+URL as an Integration under HACS Custom repositories.
 
 Minimum requirements:
 * TrueNAS Core 12.0 or TrueNAS Scale (Any version)
